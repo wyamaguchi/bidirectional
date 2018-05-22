@@ -1,7 +1,159 @@
 <?xml version="1.0" encoding="UTF-8"?>
 
-<mule xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
-	xmlns:spring="http://www.springframework.org/schema/beans" version="EE-3.9.0"
+<mule xmlns:dw="http://www.mulesoft.org/schema/mule/ee/dw"
+	xmlns:context="http://www.springframework.org/schema/context" 
+	xmlns:db="http://www.mulesoft.org/schema/mule/db" 
+	xmlns:batch="http://www.mulesoft.org/schema/mule/batch" 
+	xmlns:cassandradb="http://www.mulesoft.org/schema/mule/cassandradb" 
+	xmlns:tracking="http://www.mulesoft.org/schema/mule/ee/tracking" 
+	xmlns="http://www.mulesoft.org/schema/mule/core" 
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:spring="http://www.springframework.org/schema/beans" 
 	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
 	xsi:schemaLocation="http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans-current.xsd
-http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd"></mule>
+http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/ee/tracking http://www.mulesoft.org/schema/mule/ee/tracking/current/mule-tracking-ee.xsd
+http://www.mulesoft.org/schema/mule/cassandradb http://www.mulesoft.org/schema/mule/cassandradb/current/mule-cassandradb.xsd
+http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+http://www.mulesoft.org/schema/mule/batch http://www.mulesoft.org/schema/mule/batch/current/mule-batch.xsd
+http://www.mulesoft.org/schema/mule/ee/dw http://www.mulesoft.org/schema/mule/ee/dw/current/dw.xsd
+http://www.springframework.org/schema/context http://www.springframework.org/schema/context/spring-context-current.xsd">
+    <db:oracle-config name="Oracle_Configuration" host="localhost" port="1521" instance="orcl.william.com" user="ultimo" password="temp1234" doc:name="Oracle Configuration"/>
+    <cassandradb:config name="CassandraDB__Configuration" keyspace="ultimo" doc:name="CassandraDB: Configuration"/>
+    <spring:beans>
+  		<spring:bean id="PollSynchronizer" name="PollSynchronizer" class="bidirectionalsynctest.PollSynchronizer" scope="singleton" />
+ 	</spring:beans>	
+    
+    <flow name="triggerSyncFromOracleFlow">
+        <poll doc:name="Poll">
+            <processor-chain doc:name="Processor Chain">
+                <logger message="LOGGER00: #[app.registry['PollSynchronizer']]" level="INFO" doc:name="Logger"/>
+                <expression-component doc:name="Lock DB Polling"><![CDATA[app.registry['PollSynchronizer'].lock();
+]]></expression-component>
+                <db:select config-ref="Oracle_Configuration" doc:name="Get data from Oracle DB">
+                    <db:parameterized-query><![CDATA[SELECT * FROM sync_test]]></db:parameterized-query>
+                </db:select>
+            </processor-chain>
+        </poll>
+        <batch:execute name="fromOracleBatch" doc:name="Batch Execute"/>
+    </flow>
+    <flow name="triggerSyncFromCassandraFlow">
+        <poll doc:name="Poll">
+            <processor-chain doc:name="Processor Chain">
+                <expression-component doc:name="Lock DB Polling"><![CDATA[app.registry['PollSynchronizer'].lock();]]></expression-component>
+                <cassandradb:select config-ref="CassandraDB__Configuration" query="dsql:SELECT * FROM sync_test" doc:name="Get data from CassandraDB"/>
+            </processor-chain>
+        </poll>
+        <batch:execute name="fromCassandraBatch" doc:name="Batch Execute"/>
+    </flow>
+    <batch:job name="fromOracleBatch" max-failed-records="-1">
+        <batch:process-records>
+            <batch:step name="getAccountInCassandraStep">
+                <enricher source="#[payload.isEmpty() ? null : payload[0][lastModifiedTime_ora]]" target="#[payload.LastModifiedTimeFromCassandra]" doc:name="store 'LastModifiedTimeFromCassandra' in record var">
+                    <cassandradb:select config-ref="CassandraDB__Configuration" query="dsql:SELECT lastModifiedTime_cas FROM sync_test WHERE sync_test_id_cas = #[payload['sync_test_id_ora']]" doc:name="selectCassandraDB"/>
+                </enricher>
+            </batch:step>
+            <batch:step name="updateAccountInCassandraStep" accept-expression="((payload.LastModifiedTimeFromCassandra != null) &amp;&amp; (payload['lastModifiedTime_ora'] &gt; payload.LastModifiedTimeFromCassandra))">
+                <batch:commit size="10" doc:name="Batch Commit">
+                    <dw:transform-message doc:name="Transform Message">
+                        <dw:set-payload><![CDATA[%dw 1.0
+%output application/java
+---
+payload map ($ - 'lastModifiedTime_cas'
+			   - 'LastModifiedTimeFromCassandra')]]></dw:set-payload>
+                    </dw:transform-message>
+                    <foreach collection="#[payload]" doc:name="For Each">
+                        <dw:transform-message doc:name="Copy_of_Transform Message">
+                            <dw:set-payload><![CDATA[%dw 1.0
+%output application/java
+---
+{
+	sync_test_id_cas: payload.SYNC_TEST_ID_ORA,
+	lastmodifiedtime_cas: payload.LASTMODIFIEDTIME_ORA,
+	sync_test_text_cas: payload.SYNC_TEST_TEXT_ORA
+}
+]]></dw:set-payload>
+                        </dw:transform-message>
+                        <cassandradb:update config-ref="CassandraDB__Configuration" keyspaceName="ultimo" table="sync_test" doc:name="updateCassandraDB"/>
+                    </foreach>
+                </batch:commit>
+            </batch:step>
+            <batch:step name="insertAccountInCassandraStep" accept-expression="payload.LastModifiedTimeFromCassandra == null">
+                <batch:commit size="10" doc:name="Batch Commit">
+                    <dw:transform-message doc:name="Transform Message">
+                        <dw:set-payload><![CDATA[%dw 1.0
+%output application/java
+---
+payload map ($ - 'lastModifiedTime_cas'
+			   - 'LastModifiedTimeFromCassandra')]]></dw:set-payload>
+                    </dw:transform-message>
+                    <foreach collection="#[payload]" doc:name="For Each">
+                        <logger message="PAYLOAD00: #[payload]" level="INFO" doc:name="Logger"/>
+                        <dw:transform-message doc:name="Transform Message">
+                            <dw:set-payload><![CDATA[%dw 1.0
+%output application/java
+---
+{
+	sync_test_id_cas: payload.SYNC_TEST_ID_ORA,
+	lastmodifiedtime_cas: payload.LASTMODIFIEDTIME_ORA,
+	sync_test_text_cas: payload.SYNC_TEST_TEXT_ORA
+}
+]]></dw:set-payload>
+                        </dw:transform-message>
+                        <logger message="PAYLOAD01: #[payload]" level="INFO" doc:name="Logger"/>
+                        <cassandradb:insert config-ref="CassandraDB__Configuration" keyspaceName="ultimo" table="sync_test" doc:name="insertCassandraDB"/>
+                    </foreach>
+                </batch:commit>
+            </batch:step>
+        </batch:process-records>
+        <batch:on-complete>
+            <expression-component doc:name="Release Lock"><![CDATA[#[app.registry['PollSynchronizer'].unlock()]]]></expression-component>
+        </batch:on-complete>
+    </batch:job>
+    <batch:job name="fromCassandraBatch" max-failed-records="-1">
+        <batch:process-records>
+            <batch:step name="getAccountInOracleStep">
+                <enricher source="#[payload.isEmpty() ? null : payload[0][lastModifiedTime_cas]]" target="#[payload.LastModifiedTimeFromOracle]" doc:name="store 'LastModifiedTimeFromOracle' in record var">
+                    <db:select config-ref="Oracle_Configuration" doc:name="selectOracleDB">
+                        <db:parameterized-query><![CDATA[SELECT lastModifiedTime_ora FROM sync_test WHERE sync_test_id_ora = #[payload['sync_test_id_cas']]]]></db:parameterized-query>
+                    </db:select>
+                </enricher>
+            </batch:step>
+            <batch:step name="updateAccountInOracleStep" accept-expression="((payload.LastModifiedTimeFromOracle != null) &amp;&amp; (payload['lastModifiedTime_cas'] &gt; payload.LastModifiedTimeFromOracle))">
+                <batch:commit size="10" doc:name="Batch Commit">
+                    <dw:transform-message doc:name="Transform Message">
+                        <dw:set-payload><![CDATA[%dw 1.0
+%output application/java
+---
+payload map ($ - 'lastModifiedTime_ora'
+			   - 'LastModifiedTimeFromOracle')]]></dw:set-payload>
+                    </dw:transform-message>
+                    <db:update config-ref="Oracle_Configuration" doc:name="updateOracleDB" bulkMode="true">
+                        <db:dynamic-query><![CDATA[UPDATE sync_test SET
+lastModifiedTime_ora = #[payload['lastModifiedTime_cas']],
+sync_test_text_ora = #[payload['sync_test_text_cas']]
+WHERE sync_test_id_ora = #[payload['sync_test_id_cas']]]]></db:dynamic-query>
+                    </db:update>
+                </batch:commit>
+            </batch:step>
+            <batch:step name="insertAccountInOracleStep" accept-expression="payload.LastModifiedTimeFromOracle == null">
+                <batch:commit size="10" doc:name="Batch Commit">
+                    <dw:transform-message doc:name="Transform Message">
+                        <dw:set-payload><![CDATA[%dw 1.0
+%output application/java
+---
+payload map ($ - 'lastModifiedTime_ora'
+			   - 'LastModifiedTimeFromOracle')]]></dw:set-payload>
+                    </dw:transform-message>
+                    <db:insert config-ref="Oracle_Configuration" bulkMode="true" doc:name="insertOracleDB">
+                        <db:dynamic-query><![CDATA[INSERT INTO sync_test (SYNC_TEST_ID_ORA, SYNC_TEST_TEXT_ORA, LASTMODIFIEDTIME_ORA)
+VALUES (#[payload['sync_test_id_cas']], #[payload['sync_test_text_cas']], #[payload['lastModifiedTime_cas']])]]></db:dynamic-query>
+                    </db:insert>
+                </batch:commit>
+            </batch:step>
+        </batch:process-records>
+        <batch:on-complete>
+            <expression-component doc:name="Release Lock"><![CDATA[#[app.registry['PollSynchronizer'].unlock()]]]></expression-component>
+        </batch:on-complete>
+    </batch:job>
+</mule>
